@@ -1,0 +1,404 @@
+#!/bin/bash
+
+if [ "$(id -u)" != "0" ]; then
+   echo "[ERRORE] Questo script deve essere eseguito come root" 1>&2
+   exit 1
+fi
+
+BACKUP_MOODLE_PATH=$1
+
+if [ -z "$BACKUP_MOODLE_PATH" ]; then
+  echo "[ERRORE] Deve essere specificato un percorso per il salvataggio" 1>&2
+  exit 1
+fi
+if [[ " $BACKUP_MOODLE_PATH " =~ " / " ]]; then
+  echo "[ERRORE] Il percorso per il salvataggio non deve essere la radice del file system" 1>&2
+  exit 1
+fi
+if [ ! -d "$BACKUP_MOODLE_PATH" ]; then
+  echo "[ERRORE] Percorso \"$BACKUP_MOODLE_PATH\" per il salvataggio inesistente" 1>&2
+  exit 1
+fi
+
+MANUALMODE=$2
+RESTARTMODE=$3
+OWNERANDGROUP=$4
+
+LOCK_AND_PID_FILE_PREFIX=$5
+
+# Il file di blocco deve essere gia' definito dal processo che lancia questo comando
+# Qunado presente, il comamdo "trap" fa in modo di rimuoverlo in caso di interruzione
+# o uscita dovuta ad errore.
+if [ -f "${LOCK_AND_PID_FILE_PREFIX}.lock" ]; then
+  trap 'rm -f "${LOCK_AND_PID_FILE_PREFIX}.lock"; exit $?' INT TERM EXIT
+else
+  echo "[ERRORE] Impossibile trovare il file di blocco '.lock'" 1>&2
+  exit 1
+fi
+
+
+WAITERPROCID=$6
+
+CURRENTPROCID=$$
+
+currdir="$(realpath "${0}" | xargs dirname)"
+
+source "$currdir/../config/settings"
+if [ "$?" -ne 0 ]; then
+  echo "[ERRORE] Impossibile trovare il file 'settings' con le impostazioni di backup" 1>&2
+  exit 1
+fi
+
+# opzione comune per mysqldump
+mysqldumpmaxallowedpkgopt="--max_allowed_packet=1G"
+
+############### Acquisizione parametri di configurazione moodle ###############
+moodledbtype=$("$currdir/../utils/get-moodle-single-quoted-config-param.sh" "dbtype")
+moodledbhost=$("$currdir/../utils/get-moodle-single-quoted-config-param.sh" "dbhost")
+moodledbname=$("$currdir/../utils/get-moodle-single-quoted-config-param.sh" "dbname")
+moodledbuser=$("$currdir/../utils/get-moodle-single-quoted-config-param.sh" "dbuser")
+moodledbpswd=$("$currdir/../utils/get-moodle-single-quoted-config-param.sh" "dbpass")
+###############################################################################
+
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] Inizio backup"
+echo "$CURRENTPROCID" > "${LOCK_AND_PID_FILE_PREFIX}.pid"
+
+echo "ID del processo di backup corrente: $CURRENTPROCID"
+
+################################# Core backup #################################
+
+# disabilitazione connessione persistente (se presente) ed eventuale salvataggio
+# del valore di ripristino, nel caso di riavvio completo
+ispersistentdb=$("$currdir/../utils/get-set-moodle-persistent-db.sh")
+if [[ " ${ispersistentdb} " =~ " 1 " ]]; then
+  echo "disattivazione persistenza del db ..."
+  "$currdir/../utils/get-set-moodle-persistent-db.sh" 0
+fi
+
+# esecuzione del cron di Moodle
+# (con ritardo rispetto all'eventuale cron standard, eseguito ogni minuto)
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] pausa ..."
+sleep 5
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] lancio del cron di moodle (sincrono) ..."
+sudo -u "$servermoodledaemon" "$phpexecpath" "$moodlesiteparentpath/$moodlesitedirname/admin/cli/cron.php" >/dev/null 2>&1
+
+# abilitazione protezione sito web moodle
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] abilitazione protezione sito web moodle ..."
+sudo -u "$servermoodledaemon" "$phpexecpath" "$moodlesiteparentpath/$moodlesitedirname/admin/cli/maintenance.php" --enable
+
+# pulizia della cache
+
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] pausa ..."
+sleep 10
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] pulizia della cache ..."
+sudo -u "$servermoodledaemon" "$phpexecpath" "$moodlesiteparentpath/$moodlesitedirname/admin/cli/purge_caches.php"
+
+# arresto server web ... ma solo se viene eseguito un backup completo
+if [[ $RESTARTMODE =~ ^(2)$ ]]; then
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] pausa ..."
+  sleep 10
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] arresto servizio \"$serverservicename\" (server web) ..."
+  systemctl stop $serverservicename
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] pausa ..."
+  sleep 5
+fi
+
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] salvataggio directories"
+mkdir -p "$BACKUP_MOODLE_PATH/dir-and-files" &>/dev/null
+cd "$BACKUP_MOODLE_PATH/dir-and-files"
+# duplicazione directories
+(
+  IFS=';'
+  for dirtosave in $listofadditionaldirtosave;
+  do
+    # find '/' and replace with '-'
+    str1=${dirtosave////-}
+    # trim start symbols '-'
+    str2=${str1##-}
+    # trim end symbols '-'
+    str3=${str2%%-}
+	isdiralreadybackupped=0
+    ###################################
+    if [ -f "$BACKUP_MOODLE_PATH/dir-and-files/${str3}-directory.tgz" ]; then
+      dirwithoutfisrtslash=$(echo "$dirtosave" | sed 's:^/*::g')
+	  dirandtardiffs=$("$currdir/../utils/diff-dir-and-tar-ignore-timestamp.sh" "/" "$dirwithoutfisrtslash" "$BACKUP_MOODLE_PATH/dir-and-files/${str3}-directory.tgz" 2>&1)
+      if [ -z "${dirandtardiffs}" ]; then
+        isdiralreadybackupped=1
+      fi
+    fi
+    ###################################
+    if [[ " $isdiralreadybackupped " =~ " 1 " ]]; then
+      echo "salvataggio directory \"$dirtosave\"  -->  copia esistente invariata"
+    else
+      echo "salvataggio directory \"$dirtosave\"  -->  directory SALVATA"
+      tar -czf "${str3}-directory.tgz" "$dirtosave" &>/dev/null
+    fi
+  done
+)
+
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] dump del DB \"$moodledbname\""
+cd "$BACKUP_MOODLE_PATH"
+
+if [ -z "$moodledbhost" ]; then moodledbhost="localhost"; fi
+
+if [[ "$moodledbtype" =~ ^(mysql|mysqli|mariadb)$ ]]; then
+  mysqldump "$moodledbname" "$mysqldumpmaxallowedpkgopt" -u "$moodledbuser" -h "$moodledbhost" -p"$moodledbpswd" | gzip -c > "moodle-dbdump.sql.gz"
+elif [[ "$moodledbtype" =~ ^(postgresql|pgsql)$ ]]; then
+  export PGPASSWORD="$moodledbpswd"
+  pg_dump "$moodledbname" -U "$moodledbuser" -h "$moodledbhost" | gzip -c > "moodle-dbdump.sql.gz"
+else
+  echo "FATAL: $moodledbtype dump not implemented!"
+fi
+
+ADDIT_DB_DUMP_RELATIVE_PATH="additional-db-dump"
+mkdir -p "$BACKUP_MOODLE_PATH/$ADDIT_DB_DUMP_RELATIVE_PATH" &>/dev/null
+# duplicazione del secondo DB (e successivi, se serve)
+(
+  IFS=';'
+  for additionaldbname in $listofadditionaldbtodump;
+  do
+    echo "[$(date '+%Y/%m/%d-%H:%M:%S')] dump del DB secondario \"$additionaldbname\""
+    if [[ "$moodledbtype" =~ ^(mysql|mysqli|mariadb)$ ]]; then
+      mysqldump "$additionaldbname" "$mysqldumpmaxallowedpkgopt" -u "$moodledbuser" -h "$moodledbhost" -p"$moodledbpswd" | gzip -c > "$ADDIT_DB_DUMP_RELATIVE_PATH/${additionaldbname}-dbdump.sql.gz"
+    elif [[ "$moodledbtype" =~ ^(postgresql|pgsql)$ ]]; then
+      export PGPASSWORD="$moodledbpswd"
+      pg_dump "$additionaldbname" -U "$moodledbuser" -h "$moodledbhost" | gzip -c > "$ADDIT_DB_DUMP_RELATIVE_PATH/${additionaldbname}-dbdump.sql.gz"
+    else
+      echo "FATAL: $moodledbtype dump not implemented!"
+    fi
+  done
+)
+# remove additional dir (ONLY if empty)
+rmdir "$BACKUP_MOODLE_PATH/$ADDIT_DB_DUMP_RELATIVE_PATH" >/dev/null 2>&1
+
+# backup del sito
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] backup del sito \"$moodlesiteparentpath/$moodlesitedirname\" ... "
+cd "$moodlesiteparentpath"
+
+
+issitealreadybackupped=0
+if [ -f "$BACKUP_MOODLE_PATH/moodle-site-backup.tgz" ]; then
+  echo "il file compresso del sito esiste, vengono cercate eventuali variazioni ..."
+  #####################
+  ## Solution 1 : expand tar
+  #mkdir -p "$BACKUP_MOODLE_PATH/TEMP-moodle-site-backup"
+  #tar -xzf "$BACKUP_MOODLE_PATH/moodle-site-backup.tgz" -C "$BACKUP_MOODLE_PATH/TEMP-moodle-site-backup"
+  ## L'uso di "rsync" con opzione -i per individuare le variazoni crea
+  ## diversi problemi, quindi usiamo "diff", maggiormente affidabile
+  #differences=$(diff -rq "$moodlesiteparentpath/$moodlesitedirname" "$BACKUP_MOODLE_PATH/TEMP-moodle-site-backup/$moodlesitedirname")
+  #####################
+  ## Solution 2 : do not expand tar
+  differences=$("$currdir/../utils/diff-dir-and-tar-ignore-timestamp.sh" "$moodlesiteparentpath" "$moodlesitedirname" "$BACKUP_MOODLE_PATH/moodle-site-backup.tgz" 2>&1)
+  #####################
+  if [ -n "${differences}" ]; then
+    echo "... individuate variazioni, viene generato un nuovo file compresso"
+    ## DEBUG
+    #echo "     #######################  "
+    ###################
+    ### Solution 1 : expand tar
+    ##echo "comando: diff -rq" "$moodlesiteparentpath/$moodlesitedirname" "$BACKUP_MOODLE_PATH/TEMP-moodle-site-backup/$moodlesitedirname"
+    ###################
+    ## Solution 2 : do not expand tar
+    #echo "comando: " "$currdir/../utils/diff-dir-and-tar-ignore-timestamp.sh" "$moodlesiteparentpath" "$moodlesitedirname" "$BACKUP_MOODLE_PATH/moodle-site-backup.tgz"
+    ####################
+    #echo "${differences}"
+    #echo "     #######################  "
+  else
+    issitealreadybackupped=1
+    echo "... nessuna variazione, viene mantenuto il file compresso originale"
+  fi
+  #####################
+  ## Solution 1 : expand tar
+  ## rimozione directory temporanea usata per il confronto
+  #rm -rf "$BACKUP_MOODLE_PATH/TEMP-moodle-site-backup"
+  #####################
+fi
+
+if ! [[ " $issitealreadybackupped " =~ " 1 " ]]; then
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] generazione file compresso del sito"
+  cd "$moodlesiteparentpath"
+  tar -czf "$BACKUP_MOODLE_PATH/moodle-site-backup.tgz" "$moodlesitedirname"
+fi
+
+# salvataggio di git status / diff del codice del sito
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] verifica stato/differenze nel codice del sito (git) ... "
+cd "$moodlesiteparentpath/$moodlesitedirname"
+git status >/dev/null 2>&1
+if [ "$?" -eq 0 ]; then
+  mkdir -p "$BACKUP_MOODLE_PATH/git-code-diff-status"
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] scrittura report differenze (git diff) ..."
+  git diff > "$BACKUP_MOODLE_PATH/git-code-diff-status/moodle-code-git-diff.diff"
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] scrittura report stato (git status) ..."
+  git status > "$BACKUP_MOODLE_PATH/git-code-diff-status/moodle-code-git-status.txt"
+else
+  echo "... git NON installato o codice del sito non soggetto a versioning"
+fi
+
+# backup dei dati
+
+falsevalues=(0 '' false null)
+
+USE_RSYNC=0
+if [[ " ${MANUALMODE} " =~ " 1 " ]]; then
+  if ! [[ " ${falsevalues[@]} " =~ " ${manualrsynctosavemoodledata} " ]]; then USE_RSYNC=1; fi
+else
+  # auto (cron)
+  if ! [[ " ${falsevalues[@]} " =~ " ${rsynctosavemoodledata} " ]]; then USE_RSYNC=1; fi
+fi
+
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] backup dei dati \"$moodledataparentpath/$moodledatadirname\" ... "
+cd "$moodledataparentpath"
+
+
+if [[ " ${USE_RSYNC} " =~ " 1 " ]]; then
+  echo "... destinazione dei dati: cartella NON compressa (usato rsync)"
+  # rimozione preliminare eventuale file tar (creato con modalita alternativa)
+  rm -f "$BACKUP_MOODLE_PATH/moodle-data-backup.tar"
+  # creazione effettiva directory di backup
+  mkdir -p "$BACKUP_MOODLE_PATH/moodle-data-backup"
+  # [XXX obsolete] # # forse conviene preventivamente riconvertire il proprietario:gruppo della destinazione a root
+  # [XXX obsolete] # chown -R root:root "$BACKUP_MOODLE_PATH/moodle-data-backup"
+  # (ri)lancio del comando di sincronizzazione
+  rsync -a -o -g --delete "$moodledatadirname" "$BACKUP_MOODLE_PATH/moodle-data-backup"
+else
+  echo "... destinazione dei dati: file compresso tar/gzipped"
+  # rimozione preliminare eventuale directory di backup dei dati (creata con modalita alternativa)
+  rm -rf "$BACKUP_MOODLE_PATH/moodle-data-backup"
+  # creazione effettiva file tar
+  # Nota: la compressione del tar molto voluminoso, con dati comunque
+  # parzialmente compressi, risulterebbe estremamente lenta e con un
+  # fattore di compressione molto basso, quindi produciamo un semplice
+  # tar invece che un tgz
+  tar -cf "$BACKUP_MOODLE_PATH/moodle-data-backup.tar" "$moodledatadirname"
+fi
+
+# go back to backup dir
+cd "$BACKUP_MOODLE_PATH"
+# get ownership using current user and group
+chown -R "$OWNERANDGROUP" .
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] proprietario e gruppo dei dati di backup: \"$OWNERANDGROUP\""
+
+# NOT(donotrestart) -> resstart web server
+if ! [[ $RESTARTMODE =~ ^(2)$ ]]; then
+  # restart web server only if it is not already active
+  systemctl is-active --quiet $serverservicename
+  if [[ $? -ne 0 ]]; then
+    echo "[$(date '+%Y/%m/%d-%H:%M:%S')] riavvio servizio \"$serverservicename\" (server web) ..."
+    systemctl restart $serverservicename
+    # normalmente [sudo] systemctl [re]start apache2
+    echo "[$(date '+%Y/%m/%d-%H:%M:%S')] pausa ..."
+    sleep 5
+  fi
+fi
+
+OWNER=$(echo "$OWNERANDGROUP" | cut -d':' -f 1)
+
+###############################################################################
+# Post Job - esecuzione 1, PRIMA della uscita dalllo stato di manutenzione
+
+ # esecuzione di un file aggiuntivo opzionale (con modello in postjobcustomscript-dist.sh)
+# per trasmissione file verso una nuova destinazione
+
+# N.B.: per evitare di concedere eccessivi diritti allo script personale
+# (che per sbaglio potrebbe fare anche qualche 'rm' di troppo),
+# NON viene lanciato con i diritti di root, ma con quelli del prorietario
+# del backup
+
+if [ -f "$currdir/../config/postjobcustomscript.sh" ]; then
+  MAINTENANCE_STATUS=1
+  NEXT_RUN=1
+  if [[ $RESTARTMODE =~ ^(1|2)$ ]]; then NEXT_RUN=0; fi
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] Moodle status: MANUTENZIONE - inizio esecuzione script personalizzato come \"$OWNER\""
+  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  RETURN_DIR="$(pwd)"
+  sync
+  sudo -u "$OWNER" "$currdir/../config/postjobcustomscript.sh" "$BACKUP_MOODLE_PATH" "$MANUALMODE" "$USE_RSYNC" "$MAINTENANCE_STATUS" "$NEXT_RUN"
+  sync
+  cd "$RETURN_DIR"
+  echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+  echo "[$(date '+%Y/%m/%d-%H:%M:%S')] Moodle status: MANUTENZIONE - termine esecuzione script personalizzato"
+fi
+###############################################################################
+
+
+# NOT(donotrestart) AND NOT(halfrestart)
+if ! [[ $RESTARTMODE =~ ^(1|2)$ ]]; then
+   # disabilitazione protezione sito web moodle
+   echo "[$(date '+%Y/%m/%d-%H:%M:%S')] uscita da stato di manutenzione ..."
+   sudo -u "$servermoodledaemon" "$phpexecpath" "$moodlesiteparentpath/$moodlesitedirname/admin/cli/maintenance.php" --disable
+   # normalmente [sudo] -u www-data "$phpexecpath" "/var/www/moodle/admin/cli/maintenance.php" --disable
+   echo "[$(date '+%Y/%m/%d-%H:%M:%S')] pausa ..."
+   sleep 2
+   # lancio ASINCRONO cron: subito dopo il riavvio, forse in ore specifiche, alcune istanze
+   # di moodle impiegano tantissimo tempo sul primo cron, anche diverse ore. Per evitare questo,
+   # usiamo l'opzione -b per lanciare il primo cron in background, ovvero in modo asincrono
+   echo "[$(date '+%Y/%m/%d-%H:%M:%S')] lancio del cron di moodle (ASINCRONO) ..."
+   sudo -b -u "$servermoodledaemon" "$phpexecpath" "$moodlesiteparentpath/$moodlesitedirname/admin/cli/cron.php" >/dev/null 2>&1
+  if [[ " ${ispersistentdb} " =~ " 1 " ]]; then
+    echo "riattivazione persistenza del db ..."
+    "$currdir/../utils/get-set-moodle-persistent-db.sh" 1
+  fi
+  ###############################################################################
+  # Post Job - esecuzione 2, DOPO  uscita dallo stato di manutenzione
+  if [ -f "$currdir/../config/postjobcustomscript.sh" ]; then
+    MAINTENANCE_STATUS=0
+	NEXT_RUN=0
+    echo "[$(date '+%Y/%m/%d-%H:%M:%S')] Moodle status: ATTIVO - inizio esecuzione script personalizzato come \"$OWNER\""
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    RETURN_DIR="$(pwd)"
+    sync
+    sudo -u "$OWNER" "$currdir/../config/postjobcustomscript.sh" "$BACKUP_MOODLE_PATH" "$MANUALMODE" "$USE_RSYNC" "$MAINTENANCE_STATUS" "$NEXT_RUN"
+    sync
+    cd "$RETURN_DIR"
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    echo "[$(date '+%Y/%m/%d-%H:%M:%S')] Moodle status: ATTIVO - termine esecuzione script personalizzato"
+  fi
+  ###############################################################################
+else
+   if [[ $RESTARTMODE =~ ^(2)$ ]]; then
+     echo "ATTENZIONE: come espressamente richiesto:"
+     echo "  - il server web NON viene riavviato;"
+     echo "  - il servizio Moodle rimane in stato di manutenzione."
+     echo "Per riavviare manualmente il servizio si dovranno usare i seguenti comandi:"
+     echo "#" sudo systemctl start "$serverservicename"
+   else
+     echo "ATTENZIONE: come espressamente richiesto il servizio Moodle rimane in stato di manutenzione."
+     echo "Per arrestare anche il server web occorre usare il seguente comando:"
+     echo "#" sudo systemctl stop "$serverservicename"
+	 echo "mentre per riavviare il servizio - con il server web attivo - occore usare:"
+   fi
+   echo "#" sudo -u "$servermoodledaemon" "$phpexecpath" "$moodlesiteparentpath/$moodlesitedirname/admin/cli/maintenance.php" --disable
+   if [[ " ${ispersistentdb} " =~ " 1 " ]]; then
+     echo "La connessione del DB dovrebbe poi essere ripristinata allo stato originale 'persistente' usando:"
+	 echo "#" sudo nano "$moodlesiteparentpath/$moodlesitedirname/config.php"
+	 echo "ed impostando all'interno del file di configurazione il valore: 'dbpersist' => true"
+   fi
+fi
+
+
+#################################################################
+
+# ATTENZIONE: a questo link per rclone
+# https://it.stonybrook.edu/help/kb/using-rclone-to-backup-data
+#
+# nella sezione finale "Backing Up Data" c'è scritto
+#
+# <<However, Google limits the number of files that can be simultaneously transferred. 
+# Thus, if you wish to backup a directory with a large number of small files, the transfer rate may be much slower. 
+# [...]>>
+
+#################################################################
+
+
+if ! [ -z "$LOCK_AND_PID_FILE_PREFIX" ]; then
+   rm "${LOCK_AND_PID_FILE_PREFIX}.lock"
+   rm "${LOCK_AND_PID_FILE_PREFIX}.pid"
+fi
+
+echo "[$(date '+%Y/%m/%d-%H:%M:%S')] Termine backup"
+sync
+
+if ! [ -z "$WAITERPROCID" ]; then
+  sleep 1
+  kill $WAITERPROCID > /dev/null 2>&1
+fi

@@ -1,0 +1,69 @@
+#!/bin/bash
+
+currdir="$(realpath "${0}" | xargs dirname)"
+
+source "$currdir/../config/settings"
+if [ "$?" -ne 0 ]; then
+  echo "[ERRORE] Impossibile trovare il file 'settings' con le impostazioni di backup" 1>&2
+  exit 1
+fi
+
+if [[ "$1" =~ ^(--help|-H)$ ]]; then
+  echo "$0 [donotrestart|halfrestart]"
+  echo "donotrestart: il server web non viene riavviato dopo il backup"
+  echo "halfrestart: il server web viene riavviato, ma Moodle rimane in 'manutenzione'"
+  exit
+fi
+
+sudo echo "Controllo 'sudo' ok ..."
+if [ "$?" -ne 0 ]; then
+  echo "[ERRORE] Impossibile eseguire il comando, password non corretta" 1>&2
+  exit 1
+fi
+
+
+######### OBSOLETO - acquisizione e controllo interattivo password DB #########
+
+#echo "Password di $moodledbuser per $moodledbtype: "
+#read -s dbpswd
+#if [ -z "$dbpswd" ]; then
+#  echo "Impossibile accedere al DB senza alcuna password"
+#  exit
+#fi
+#
+#hostoption=""
+#if ! [[ "$moodledbhost" =~ ^(localhost|127.0.0.1)$ ]]; then hostoption="-h $moodledbhost"; fi
+#
+#if [[ "$moodledbtype" =~ ^(mysql|mysqli|mariadb)$ ]]; then
+#  $moodledbtype $moodledbname -u $moodledbuser $hostoption -p$dbpswd -B -e"exit" &>/dev/null
+#elif [[ "$moodledbtype" =~ ^(postgresql|pgsql)$ ]]; then
+#  export PGPASSWORD="$dbpswd"
+#  psql $moodledbname -U $moodledbuser $hostoption -c "\q" &>/dev/null
+#else
+#  echo "FATAL: database $moodledbtype non riconosciuto"
+#  exit
+#fi
+#if [ "$?" -ne 0 ]; then
+#  echo "Impossibile accedere al DB, password non corretta"
+#  exit
+#fi
+#echo "Controllo accesso DB ok ..."
+
+###############################################################################
+
+
+OUTDATAOWNERANDGROUP=$manualsaveddataownerandgroup
+if [ -z "$OUTDATAOWNERANDGROUP" ]; then
+  ## when manualsaveddataownerandgroup is undefined, use current user and group
+  OUTDATAOWNERANDGROUP=$(whoami):$(groups | sed -r 's/ .*//g')
+fi
+
+RESTARTMODE=0
+if [[ "$1" =~ ^(halfrestart|half-restart|half_restart|half restart)$ ]]; then RESTARTMODE=1 ; fi
+if [[ "$1" =~ ^(donotrestart|do-not-restart|do_not_restart|do not restart)$ ]]; then RESTARTMODE=2 ; fi
+
+echo "Lancio esecuzione ASINCRONA backup"
+
+sudo "$currdir/backup-moodle-starter" "manual" "$RESTARTMODE" "$OUTDATAOWNERANDGROUP"
+
+#### OBSOLETO - anticamente veniva passato il parametro $dbpswd acquisito interattivamente

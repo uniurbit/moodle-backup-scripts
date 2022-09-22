@@ -1,0 +1,63 @@
+#!/bin/bash
+
+################### parametri di configurazione ################
+
+### Output
+
+# il backup viene scritto sul seguente percorso
+backuptargetparentpath='/BACKUP/backupmoodle'
+#
+# e' il prefisso della directory creata, che sara' seguito dalla data
+backuptargetdirname="moodle-backup"
+# conviene usare il nome del sito moodle, ad esempio blended-backup,
+# elearning-backup, education-backup 
+
+## If you use a separated disk as a target for the backup, the command `lsblk -o UUID,MOUNTPOINT`
+## shows the UUIDs for each mounted disk. Otherwise, the command `sudo blkid -c /dev/null`
+## can be used to show all the UUIDs, even for not mounted disks.
+## Then, for greater security, you can set backuptargetcheckmountbyuuid using the wanted UUID, so the
+## presence of the target disk will be checked before backup.
+#backuptargetcheckmountbyuuid=xxx-yyyy-zzzz
+
+### Input
+
+listofadditionaldbtodump='vademecum'
+# esempio di dump di vari db: 'vademecum;altrodb;tempdb'
+
+listofadditionaldirtosave='/var/spool/cron;'\
+'/etc/apache2;/etc/php;'\
+'/etc/mysql;/etc/apt;/etc/shibboleth;/etc/iptables'
+# ... altre eventuali directories
+
+moodlesiteparentpath='/var/www'
+moodlesitedirname='moodle'
+moodledataparentpath="/DATI"
+moodledatadirname="moodledata"
+
+### Config
+
+servermoodledaemon='www-data'
+serverservicename='apache2'
+
+phpexecpath='/usr/bin/php'
+
+## [lancio mediante cron] se rsynctosavemoodledata risulta assente,
+## commentato, o impostato 0 oppure a false, allora il backup dell'area
+## dati di moodle viene fatto producendo in output un file tar (non compresso).
+## Altrimenti viene usato rsync, che produce come output una directory
+## con tanti file, esattamente come quella originale.
+rsynctosavemoodledata=1
+
+## [lancio manuale] il parametro manualrsynctosavemoodledata e' simile
+## ad rsynctosavemoodledata, ma viene usato quando il lancio e' manuale
+manualrsynctosavemoodledata=0
+
+## Il lancio mediante cron, quando il valore saveddataownerandgroup
+## risulta ASSENTE o commentato, per default dovrebbe usare il valore
+## di servermoodledaemon sia come proprietario che come gruppo
+saveddataownerandgroup='www-data:www-data'
+
+## Il lancio a mano, quando il valore manualsaveddataownerandgroup
+## risulta ASSENTE o commentato, per default dovrebbe usare l'utente
+## ed il gruppo correnti
+#manualsaveddataownerandgroup='www-data:www-data'

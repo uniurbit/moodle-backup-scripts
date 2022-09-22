@@ -1,0 +1,92 @@
+#!/bin/bash
+
+if [ "$(id -u)" != "0" ]; then
+   echo "[ERRORE] Questo script deve essere eseguito come root" 1>&2
+   exit 1
+fi
+
+currdir="$(realpath "${0}" | xargs dirname)"
+
+source "$currdir/../config/settings"
+if [ "$?" -ne 0 ]; then
+  echo "[ERRORE] Impossibile trovare il file 'settings' con le impostazioni di backup" 1>&2
+  exit 1
+fi
+
+MANUAL_EXEC=$1
+RESTARTMODE=$2
+if [ -z "$RESTARTMODE" ]; then
+  RESTARTMODE=0
+fi
+
+OWNERANDGROUP=$3
+
+RELATIVELOGFILENAME="backuplogfile-$(date +%Y%m%d%H%M%S).txt"
+
+if [[ -n $backuptargetcheckmountbyuuid ]]; then
+  mountpoint=$(lsblk -o UUID,MOUNTPOINT | awk -v u="$backuptargetcheckmountbyuuid" '$1 == u {print $2}')
+  if ! [[ -n $mountpoint ]]; then
+    echo "[ERRORE] Nessun punto di mount per l'UUID \"$backuptargetcheckmountbyuuid\"" 1>&2
+    exit 1
+  fi
+fi
+
+BACKUP_MOODLE_PATH="$backuptargetparentpath/${backuptargetdirname}-last"
+if [[ " $BACKUP_MOODLE_PATH " =~ " / " ]]; then
+  echo "[ERRORE] Il percorso per il salvataggio non deve essere la radice del file system" 1>&2
+  exit 1
+fi
+
+mkdir -p "$BACKUP_MOODLE_PATH"  &>/dev/null
+if [ "$?" -ne 0 ]; then
+  echo "[ERRORE] Impossibile creare la directory \"$BACKUP_MOODLE_PATH\"" 1>&2
+  exit 1
+fi
+
+LOCK_AND_PID_FILE_PREFIX="$BACKUP_MOODLE_PATH/_current-backup-process" 
+if { set -C; 2>/dev/null >"${LOCK_AND_PID_FILE_PREFIX}.lock"; }; then
+  : # nop
+else
+  echo "[ATTENZIONE] Rilevato file 'lock' nella directory target: presente altro processo di backup in corso" 1>&2
+  exit 1
+fi
+
+############
+
+mkdir -p "$BACKUP_MOODLE_PATH/prev-logs"  &>/dev/null
+
+# nota: la wildcard * deve essere tenuta fuori dai doppi apici, altrimenti crea problemi
+mv "$BACKUP_MOODLE_PATH/backuplogfile-"* "$BACKUP_MOODLE_PATH/prev-logs/" 2>/dev/null
+
+# NOTA: non è necessario rimuovere selettivamente il contenuto della cartella
+# principale ed eventuali altre, visto che viene eseguito l'overwriting dei
+# file con lo stesso titolo.
+
+ABSLOGFILENAME="$BACKUP_MOODLE_PATH/$RELATIVELOGFILENAME"
+
+echo "$RELATIVELOGFILENAME" > "$ABSLOGFILENAME"
+echo "-------------------------------------------------------------------------" >> "$ABSLOGFILENAME"
+
+MANUALMODE=0
+if [[ " ${MANUAL_EXEC} " =~ " manual " ]]; then
+  # lancio manuale asincrono
+  MANUALMODE=1
+  echo "Directory di destinazione: $BACKUP_MOODLE_PATH"
+  echo "Visualizzazione log in uscita (CTRL+C per interrompere SOLO la visualizzazione)"
+  echo " "
+  tail -f "$ABSLOGFILENAME" &
+  TAILPROCESSID=$!
+  # lancio ASINCRONO del processo di backup, in background (opzione -b)
+  sudo -b "$currdir/backup-moodle-core" "$BACKUP_MOODLE_PATH" "$MANUALMODE" "$RESTARTMODE" "$OWNERANDGROUP" "$LOCK_AND_PID_FILE_PREFIX" "$TAILPROCESSID" &>> "$ABSLOGFILENAME"
+  # attesa del termine del processo tail (che sara' "killed" dal processo di backup, alla fine)
+  wait $TAILPROCESSID > /dev/null 2>&1
+else
+  # lancio super utente mediante cron
+  OWNERANDGROUP=$saveddataownerandgroup
+  if [ -z "$OWNERANDGROUP" ]; then
+    ## when saveddataownerandgroup is undefined, use current user and group
+    OWNERANDGROUP="${servermoodledaemon}:${servermoodledaemon}"
+  fi
+  # lancio SINCRONO del processo di backup
+  "$currdir/backup-moodle-core" "$BACKUP_MOODLE_PATH" "$MANUALMODE" "$RESTARTMODE" "$OWNERANDGROUP" "$LOCK_AND_PID_FILE_PREFIX" "$TAILPROCESSID" &>> "$ABSLOGFILENAME"
+fi

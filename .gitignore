@@ -1,0 +1,8 @@
+# Customized post-job script (instance of distribution template postjobcustomscript-dist.sh)
+postjobcustomscript.sh
+
+# Specific settings file (instance of distribution template settings-dist)
+settings
+
+# Generic backup files
+*.bak
